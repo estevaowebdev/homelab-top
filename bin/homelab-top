@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Monitor de terminal simples para o homelab, sem dependências externas obrigatórias."""
+import curses, os, re, subprocess, time
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+def cmd(args, timeout=1.5):
+    try: return subprocess.run(args, text=True, capture_output=True, timeout=timeout).stdout.strip()
+    except Exception: return ""
+
+def human(n):
+    n=float(n)
+    for u in ('B','KiB','MiB','GiB','TiB'):
+        if n < 1024: return f'{n:.1f}{u}'
+        n /= 1024
+    return f'{n:.1f}PiB'
+
+def temp_sensors():
+    data = {}
+    if psutil:
+        try:
+            for chip, entries in psutil.sensors_temperatures().items():
+                for e in entries:
+                    if e.current > -100: data[f'{chip}/{e.label or "temp"}'] = e.current
+        except Exception: pass
+    return data
+
+def gpu_info():
+    out = cmd(['nvidia-smi','--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total','--format=csv,noheader,nounits'])
+    if out:
+        return 'NVIDIA: ' + out.replace(', ', ' | ')
+    rows=[]
+    for root, _, files in os.walk('/sys/class/drm'):
+        if not root.endswith('/device') or 'card' not in root: continue
+        name = open(os.path.join(root,'uevent')).read() if os.path.exists(os.path.join(root,'uevent')) else ''
+        vendor = 'Intel' if '0x8086' in name else ('AMD' if '0x1002' in name else 'GPU')
+        rows.append(vendor + ' (temperatura/uso não expostos pelo driver)')
+    return '; '.join(dict.fromkeys(rows)) or 'não detectada'
+
+def ram_type():
+    out = cmd(['sudo','-n','dmidecode','-t','memory'], 1)
+    if not out: out = cmd(['dmidecode','-t','memory'], 1)
+    types = re.findall(r'^\s*Type:\s*(?!Unknown)(.+)$', out, re.M)
+    speeds = re.findall(r'^\s*Speed:\s*(?!Unknown)(.+)$', out, re.M)
+    result = ', '.join(dict.fromkeys(types)) or 'não disponível'
+    return result + ((' @ '+speeds[0]) if speeds else '')
+
+def devices():
+    wifi = cmd(['nmcli','-t','-f','DEVICE,TYPE,STATE,CONNECTION','device'])
+    usb = cmd(['lsusb'])
+    return wifi, usb
+
+def docker_lines():
+    out=cmd(['docker','ps','--format','{{.Names}}|{{.Status}}|{{.Image}}'])
+    return out.splitlines() if out else []
+
+def shorten(value, width):
+    value=value.strip()
+    return value if len(value) <= width else value[:max(1,width-1)]+'…'
+
+def process_lines(limit=12):
+    if not psutil: return []
+    # psutil/Linux pode retornar até 100% por núcleo (ex.: 741% = 7,41 núcleos).
+    # Normalizamos para que a coluna represente o total da máquina: 0–100%.
+    logical_cpus = psutil.cpu_count() or 1
+    rows=[]
+    for p in psutil.process_iter(['pid','name','username','cpu_percent','memory_info']):
+        try:
+            mi=p.info['memory_info']
+            cpu_total = (p.info['cpu_percent'] or 0) / logical_cpus
+            rows.append((cpu_total, p.info['pid'], p.info['name'] or '?', mi.rss if mi else 0, p.info['username'] or '?'))
+        except (psutil.NoSuchProcess, psutil.AccessDenied): pass
+    return sorted(rows, reverse=True)[:limit]
+
+def bar(value, width=18):
+    n=max(0,min(width,int(value/100*width))); return '['+'█'*n+'░'*(width-n)+']'
+
+def mini_bar(value, width=8):
+    n=max(0,min(width,int(value/100*width)))
+    return '█'*n+'░'*(width-n)
+
+def level(value, warning=70, critical=90):
+    return 2 if value >= critical else (1 if value >= warning else 0)
+
+def draw(stdscr):
+    curses.curs_set(0); stdscr.nodelay(True); stdscr.timeout(1000)
+    curses.start_color(); curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)
+    curses.init_pair(3, curses.COLOR_RED, -1)
+    curses.init_pair(4, curses.COLOR_CYAN, -1)
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    colors=[curses.color_pair(1), curses.color_pair(2), curses.color_pair(3)]
+    section=curses.color_pair(4) | curses.A_BOLD
+    if psutil: psutil.cpu_percent(None)
+    while True:
+        key=stdscr.getch()
+        if key in (ord('q'),ord('Q'),27): break
+        stdscr.erase(); h,w=stdscr.getmaxyx(); y=0
+        def line(s='', attr=0):
+            nonlocal y
+            if y < h-1:
+                stdscr.addnstr(y,0,s,max(1,w-1),attr)
+                y+=1
+        def heading(title):
+            line('─' * min(w-1, 76), curses.color_pair(4))
+            line('  '+title, section)
+        def metric(label, value, suffix=''):
+            line(f'{label:<7} {bar(value)} {value:5.1f}%{suffix}', colors[level(value)])
+        now=time.strftime('%d/%m/%Y %H:%M:%S')
+        line(f' HOMELAB-TOP   {now}   [q] sair  [atualização: 1s]', curses.A_BOLD | curses.color_pair(5))
+        if psutil:
+            vm=psutil.virtual_memory(); cpu=psutil.cpu_percent(); swap=psutil.swap_memory()
+            cores=psutil.cpu_percent(percpu=True)
+            heading('RECURSOS PRINCIPAIS')
+            metric('CPU', cpu)
+            # Mini gráficos: quatro núcleos por linha para preservar espaço vertical.
+            line('NÚCLEOS  ' + '   '.join(
+                f'C{i} [{mini_bar(v)}] {v:4.1f}%' for i, v in enumerate(cores[:4])
+            ), colors[level(max(cores[:4], default=0))])
+            if len(cores) > 4:
+                line('          ' + '   '.join(
+                    f'C{i} [{mini_bar(v)}] {v:4.1f}%' for i, v in enumerate(cores[4:8], 4)
+                ), colors[level(max(cores[4:8], default=0))])
+            if len(cores) > 8:
+                for start in range(8, len(cores), 4):
+                    group=cores[start:start+4]
+                    line('          ' + '   '.join(
+                        f'C{i} [{mini_bar(v)}] {v:4.1f}%' for i, v in enumerate(group, start)
+                    ), colors[level(max(group, default=0))])
+            metric('RAM', vm.percent, f'   {human(vm.used)} / {human(vm.total)}')
+            line(f"SWAP    {human(swap.used)} / {human(swap.total)} ({swap.percent:.1f}%)", colors[level(swap.percent)])
+        temps=temp_sensors(); proc=[v for k,v in temps.items() if any(x in k.lower() for x in ('coretemp','cpu','package'))]
+        heading('TEMPERATURAS E HARDWARE')
+        cpu_temp=max(proc) if proc else 0
+        line('CPU     '+(f'{cpu_temp:.1f}°C' if proc else 'n/d'), colors[level(cpu_temp,75,90)])
+        line('Sensores: '+(' | '.join(f'{k.split("/")[-1]} {v:.1f}°C' for k,v in list(temps.items())[:4]) or 'não disponíveis'))
+        line('RAM     '+ram_type())
+        line('GPU     '+gpu_info())
+        wifi, usb=devices(); heading('REDE / WI-FI')
+        for x in wifi.splitlines()[:3]: line('  '+x.replace(':','  |  '), curses.color_pair(1) if ':connected:' in x else 0)
+        heading('USB')
+        line('  '+(usb.splitlines()[0] if usb else 'nenhum dispositivo listado'))
+        heading('SERVIÇOS / CONTAINERS DOCKER')
+        ds=docker_lines();
+        name_w, status_w = 27, 25
+        image_w=max(18, w-6-name_w-status_w)
+        line(f'  {"NOME":<{name_w}}  {"STATUS":<{status_w}}  {"IMAGEM":<{image_w}}', curses.A_DIM | curses.A_BOLD)
+        line('  '+'─'*min(w-3, name_w+status_w+image_w+4), curses.color_pair(4))
+        for x in ds[:min(6,h-y-8)]:
+            fields=x.split('|',2)
+            if len(fields) != 3: continue
+            name,status,image=fields
+            row=(f'  {shorten(name,name_w):<{name_w}}  '
+                 f'{shorten(status,status_w):<{status_w}}  '
+                 f'{shorten(image,image_w):<{image_w}}')
+            line(row, curses.color_pair(1) if status.startswith('Up ') else curses.color_pair(3))
+        heading('PROCESSOS — maior uso de CPU (total da máquina)')
+        line('  CPU     RAM       PROCESSO                         PID     USUÁRIO', curses.A_DIM)
+        for cpu,pid,name,rss,user in process_lines()[:max(0,h-y-2)]:
+            line(f'  {cpu:5.1f}%  {human(rss):>8}  {name[:30]:30}  {pid:<7} {user[:12]}', colors[level(cpu)])
+        stdscr.refresh()
+
+if __name__=='__main__': curses.wrapper(draw)
